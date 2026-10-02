@@ -1,45 +1,11 @@
 #!/usr/bin/env bash
-# =============================================================================
-#  vm-bootstrap.sh — fresh Debian/Ubuntu dev VM in one go
-#
-#  Run as root. The script creates the unprivileged user "agent" and
-#  re-executes itself as that user; every step below then runs as agent
-#  (system changes via passwordless sudo). Rationale: Claude Code refuses
-#  --dangerously-skip-permissions for uid 0, and agents (t3 code, codex, grok)
-#  should not run as root anyway.
-#
-#  Steps (in order):
-#    agent    user "agent": bash, /home/agent, no login password, NOPASSWD sudo
-#    base     curl, wget, git, jq, ca-certificates, build tools
-#    node     Node.js (NodeSource) + latest npm
-#    docker   Docker CE from the official Docker apt repo
-#    claude   Claude Code CLI          (~/.local/bin of agent)
-#    grok     xAI Grok CLI             (~/.local/bin of agent)
-#    codex    OpenAI Codex CLI         (~/.local/bin of agent)
-#    t3       t3 (npm, global)
-#    git      gh + glab, login to any number of GitHub / GitLab accounts;
-#             credentials go to /etc/git-credentials + /etc/gitconfig so git
-#             works for ANY user with NO TTY and NO HOME (how agents run it);
-#             each account is verified that way, then `t3 connect` runs
-#    remind   what is left to do by hand (subscription logins)
-#
-#  Usage:
-#    bash vm-bootstrap.sh                 run everything
-#    bash vm-bootstrap.sh --only git      only the git / account setup
-#    bash vm-bootstrap.sh --skip docker,codex
-#    bash vm-bootstrap.sh --list          show steps
-#
-#  Environment overrides: AGENT_USER (default agent), NODE_MAJOR (default 26)
-#  Re-running is safe: every step is idempotent. After the first run the
-#  script lives at /home/agent/vm-bootstrap.sh and can be re-run as agent.
-# =============================================================================
 set -euo pipefail
 
 AGENT_USER="${AGENT_USER:-agent}"
 AGENT_HOME="/home/${AGENT_USER}"
 AGENT_SCRIPT="${AGENT_HOME}/vm-bootstrap.sh"
 NODE_MAJOR="${NODE_MAJOR:-26}"
-GLAB_FALLBACK_VERSION="1.120.0"       # used if the GitLab API can't be reached
+GLAB_FALLBACK_VERSION="1.120.0"
 
 CRED_FILE="/etc/git-credentials"
 CRED_GROUP="gitcreds"
@@ -48,7 +14,6 @@ GLAB_BIN="/usr/bin/glab"
 
 ALL_STEPS=(agent base node docker claude grok codex t3 git remind)
 
-# ----------------------------------------------------------------------------- ui
 if [[ -t 1 ]]; then
   C_RESET=$'\e[0m'; C_BOLD=$'\e[1m'; C_DIM=$'\e[2m'
   C_BLUE=$'\e[34m'; C_GREEN=$'\e[32m'; C_YELLOW=$'\e[33m'; C_RED=$'\e[31m'
@@ -68,7 +33,7 @@ warn()  { printf '%s  ! %s%s\n' "$C_YELLOW" "$*" "$C_RESET"; }
 fail()  { printf '%s  ✘ %s%s\n' "$C_RED" "$*" "$C_RESET" >&2; }
 die()   { fail "$@"; exit 1; }
 
-ask() {               # ask "Prompt" [default] → echoes answer
+ask() {
   local prompt="$1" default="${2:-}" answer
   if [[ -n "$default" ]]; then
     read -r -p "  $prompt [$default]: " answer </dev/tty
@@ -78,13 +43,13 @@ ask() {               # ask "Prompt" [default] → echoes answer
     printf '%s' "$answer"
   fi
 }
-ask_secret() {        # like ask, but no echo
+ask_secret() {
   local answer
   read -r -s -p "  $1: " answer </dev/tty
   printf '\n' >/dev/tty
   printf '%s' "$answer"
 }
-choose() {            # choose "Prompt" opt1 opt2 ... → echoes chosen index (1-based)
+choose() {
   local prompt="$1"; shift
   local i=1 answer
   for opt in "$@"; do printf '    %d) %s\n' "$i" "$opt" >/dev/tty; i=$((i+1)); done
@@ -99,7 +64,7 @@ choose() {            # choose "Prompt" opt1 opt2 ... → echoes chosen index (1
 apt_install() { sudo apt-get install -y -q "$@"; }
 apt_update()  { sudo apt-get update -q; }
 
-ensure_path_line() {  # ensure_path_line <dir> → adds to ~/.bashrc and ~/.profile once
+ensure_path_line() {
   local dir="$1" line rc
   line="export PATH=\"$dir:\$PATH\""
   for rc in "$HOME/.bashrc" "$HOME/.profile"; do
@@ -109,14 +74,6 @@ ensure_path_line() {  # ensure_path_line <dir> → adds to ~/.bashrc and ~/.prof
   case ":$PATH:" in *":$dir:"*) ;; *) export PATH="$dir:$PATH" ;; esac
 }
 
-# ============================================================================= agent user
-#  Runs as root, before anything else. Properties of the account:
-#    * no login password         → `su - agent` never prompts; SSH password
-#                                  login stays impossible (PermitEmptyPasswords no)
-#    * NOPASSWD sudo             → full system access without prompts
-#    * bash, /home/agent         → claude / grok / codex / t3 live there
-#  Claude Code only blocks --dangerously-skip-permissions for uid 0 (unless
-#  IS_SANDBOX=1), so sudo rights on a non-root user are not a problem.
 create_agent_user() {
   if ! id "$AGENT_USER" >/dev/null 2>&1; then
     useradd --create-home --shell /bin/bash --user-group "$AGENT_USER"
@@ -130,7 +87,6 @@ create_agent_user() {
   visudo -cf "/etc/sudoers.d/${AGENT_USER}" >/dev/null || die "invalid sudoers entry for $AGENT_USER"
 }
 
-# Copy this script into agent's home and continue there. Never returns.
 reexec_as_agent() {
   [[ -f "$0" ]] || die "Run from a saved file (bash vm-bootstrap.sh), not a pipe: the script re-executes itself as $AGENT_USER."
   install -m 0755 -o "$AGENT_USER" -g "$AGENT_USER" "$0" "$AGENT_SCRIPT"
@@ -149,7 +105,6 @@ step_agent() {
   ok "passwordless sudo works; no login password set"
 }
 
-# ============================================================================= steps
 step_base() {
   step "Base packages"
   apt_update
@@ -224,14 +179,6 @@ step_t3() {
   ok "t3 $(t3 --version 2>/dev/null || echo installed)"
 }
 
-# ----------------------------------------------------------------------------- git
-#  Design goal: `git` must authenticate for ANY Linux user, with NO TTY, NO HOME
-#  and a minimal PATH — exactly how an agent (t3 code, CI, cron) runs it.
-#    * all wiring lives in /etc/gitconfig           (not ~/.gitconfig)
-#    * tokens live in /etc/git-credentials          (root:gitcreds 0640) and are
-#      tried FIRST; gh/glab are only a fallback with absolute binary paths
-#    * GIT_TERMINAL_PROMPT=0 globally → fail fast instead of hanging an agent
-#    * every account is verified with `env -i ... git ls-remote` at the end
 install_gh() {
   command -v gh >/dev/null && { info "gh $(gh --version | head -1 | awk '{print $3}') present"; return; }
   sudo install -m 0755 -d /etc/apt/keyrings
@@ -247,7 +194,6 @@ install_gh() {
 
 install_glab() {
   command -v glab >/dev/null && { info "glab $(glab version 2>/dev/null | awk '{print $3}' | head -1) present"; return; }
-  # Distro packages of glab are ancient (no --device login) → official .deb
   local ver deb tmp
   ver="$(curl -fsSL 'https://gitlab.com/api/v4/projects/gitlab-org%2Fcli/releases/permalink/latest' 2>/dev/null \
          | jq -r '.tag_name' 2>/dev/null | sed 's/^v//')" || true
@@ -261,32 +207,26 @@ install_glab() {
   ok "glab ${ver}"
 }
 
-# One-time system wiring (idempotent)
 git_system_setup() {
-  # shared credential store, readable by root + members of $CRED_GROUP
   sudo groupadd -f "$CRED_GROUP"
   sudo touch "$CRED_FILE"
   sudo chown "root:$CRED_GROUP" "$CRED_FILE"
   sudo chmod 0640 "$CRED_FILE"
-  # every regular user on the box (uid >= 1000) may read it
   local u
   while IFS= read -r u; do
     id -nG "$u" 2>/dev/null | grep -qw "$CRED_GROUP" || sudo usermod -aG "$CRED_GROUP" "$u"
   done < <(awk -F: '$3>=1000 && $3<65534 {print $1}' /etc/passwd)
 
-  # /etc/gitconfig — the generic store helper is tried first for every host
   sudo git config --system --unset-all credential.helper 2>/dev/null || true
   sudo git config --system credential.helper "store --file=${CRED_FILE}"
   sudo git config --system core.askPass ""
-  sudo git config --system safe.directory '*'          # repos owned by another user are fine
+  sudo git config --system safe.directory '*'
   sudo git config --system init.defaultBranch main
 
-  # never let an agent hang on a username/password prompt
   printf 'export GIT_TERMINAL_PROMPT=0\nexport GIT_ASKPASS=\n' | sudo tee /etc/profile.d/git-noprompt.sh >/dev/null
   grep -q '^GIT_TERMINAL_PROMPT=' /etc/environment 2>/dev/null \
     || echo 'GIT_TERMINAL_PROMPT=0' | sudo tee -a /etc/environment >/dev/null
 
-  # HTTPS everywhere: kill any https→ssh rewrites in system/global config
   local scope k
   for scope in --system --global; do
     for k in $(git config $scope --name-only --get-regexp '^url\..*\.insteadof$' 2>/dev/null || true); do
@@ -295,16 +235,14 @@ git_system_setup() {
   done
 }
 
-# per-host fallback helper (store is already first via the generic entry)
-wire_git_host() {     # wire_git_host <host> <helper-cmd>
+wire_git_host() {
   local url="https://$1" helper="$2"
   sudo git config --system --unset-all "credential.${url}.helper" 2>/dev/null || true
   sudo git config --system "credential.${url}.helper" "$helper"
 }
 
-store_git_credential() {  # store_git_credential <host> <username> <token>
+store_git_credential() {
   local host="$1" user="$2" tok="$3"
-  # drop an older entry for the same host+user, then add
   printf 'protocol=https\nhost=%s\nusername=%s\n' "$host" "$user" \
     | sudo git credential-store --file "$CRED_FILE" erase 2>/dev/null || true
   printf 'protocol=https\nhost=%s\nusername=%s\npassword=%s\n' "$host" "$user" "$tok" \
@@ -312,13 +250,12 @@ store_git_credential() {  # store_git_credential <host> <username> <token>
   sudo chown "root:$CRED_GROUP" "$CRED_FILE"; sudo chmod 0640 "$CRED_FILE"
 }
 
-# The real test: no HOME, no TTY, minimal PATH — how an agent runs git.
-agent_git_check() {   # agent_git_check <https-repo-url>
+agent_git_check() {
   env -i PATH=/usr/local/bin:/usr/bin:/bin HOME=/nonexistent GIT_TERMINAL_PROMPT=0 \
       git ls-remote "$1" HEAD >/dev/null 2>&1
 }
 
-verify_host() {       # verify_host <host> <repo-url or empty>
+verify_host() {
   local host="$1" url="$2"
   if [[ -z "$url" ]]; then
     warn "$host: no repo found on this account to test with — add one, or test a URL from the hub menu"
@@ -478,7 +415,6 @@ step_git() {
   install_glab
   git_system_setup
 
-  # identity: for agent (global) and as system-wide fallback for every other user
   local cur_name cur_mail name mail
   cur_name="$(git config --global user.name  || true)"
   cur_mail="$(git config --global user.email || true)"
@@ -492,7 +428,6 @@ step_git() {
   account_hub
   verify_all
 
-  # interactive t3 code account link, as agent, once git is proven to work
   if command -v t3 >/dev/null; then
     echo
     printf '  %sConnecting t3 code (t3 connect)%s\n' "$C_BOLD" "$C_RESET"
@@ -525,8 +460,25 @@ step_remind() {
 EOF
 }
 
-# ============================================================================= main
-usage() { sed -n '2,/^# ====*$/p' "$0" | sed '$d' | sed 's/^# \{0,1\}//'; }
+usage() {
+  cat <<EOF
+vm-bootstrap.sh — fresh Debian/Ubuntu dev VM in one go
+
+Run as root. Creates the unprivileged user "${AGENT_USER}" (no login password,
+NOPASSWD sudo) and re-executes itself as that user; every step runs as ${AGENT_USER}.
+
+Steps: ${ALL_STEPS[*]}
+
+Usage:
+  bash vm-bootstrap.sh                 run everything
+  bash vm-bootstrap.sh --only git      only the git / account setup
+  bash vm-bootstrap.sh --skip docker,codex
+  bash vm-bootstrap.sh --list          show steps
+
+Environment: AGENT_USER (default agent), NODE_MAJOR (default 26)
+Re-running is safe; after the first run use: bash ${AGENT_SCRIPT} [options]
+EOF
+}
 
 ORIG_ARGS=("$@")
 ONLY=""; SKIP=""
@@ -541,7 +493,6 @@ while [[ $# -gt 0 ]]; do
 done
 
 [[ -r /etc/os-release ]] || die "Unsupported OS: /etc/os-release missing."
-# shellcheck disable=SC1091
 . /etc/os-release
 DISTRO_ID="${ID:-debian}"
 DISTRO_CODENAME="${VERSION_CODENAME:-}"
@@ -551,7 +502,6 @@ case "$DISTRO_ID" in
   *) warn "Untested distro '$DISTRO_ID' — proceeding as if Debian." ;;
 esac
 
-# --- phase 1 (root): create agent, hand over. Phase 2 below runs as agent.
 if [[ "$(id -un)" != "$AGENT_USER" ]]; then
   [[ $EUID -eq 0 ]] || die "Run as root (the script switches to $AGENT_USER by itself)."
   create_agent_user
