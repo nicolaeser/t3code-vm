@@ -2,19 +2,26 @@
 # =============================================================================
 #  vm-bootstrap.sh — fresh Debian/Ubuntu dev VM in one go
 #
+#  Run as root. The script creates the unprivileged user "agent" and
+#  re-executes itself as that user; every step below then runs as agent
+#  (system changes via passwordless sudo). Rationale: Claude Code refuses
+#  --dangerously-skip-permissions for uid 0, and agents (t3 code, codex, grok)
+#  should not run as root anyway.
+#
 #  Steps (in order):
+#    agent    user "agent": bash, /home/agent, no login password, NOPASSWD sudo
 #    base     curl, wget, git, jq, ca-certificates, build tools
 #    node     Node.js (NodeSource) + latest npm
 #    docker   Docker CE from the official Docker apt repo
-#    claude   Claude Code CLI
-#    grok     xAI Grok CLI
-#    codex    OpenAI Codex CLI
+#    claude   Claude Code CLI          (~/.local/bin of agent)
+#    grok     xAI Grok CLI             (~/.local/bin of agent)
+#    codex    OpenAI Codex CLI         (~/.local/bin of agent)
 #    t3       t3 (npm, global)
-#    git      gh + glab, login to as many GitHub / gitlab.com / self-hosted GitLab
-#             accounts as you like; credentials go to /etc/git-credentials and
-#             /etc/gitconfig so git works for ANY user, with NO TTY and NO HOME
-#             (how t3 code / agents run it) — each account is verified that way
-#    remind   list of subscriptions / CLIs you still need to log in to
+#    git      gh + glab, login to any number of GitHub / GitLab accounts;
+#             credentials go to /etc/git-credentials + /etc/gitconfig so git
+#             works for ANY user with NO TTY and NO HOME (how agents run it);
+#             each account is verified that way, then `t3 connect` runs
+#    remind   what is left to do by hand (subscription logins)
 #
 #  Usage:
 #    bash vm-bootstrap.sh                 run everything
@@ -22,16 +29,24 @@
 #    bash vm-bootstrap.sh --skip docker,codex
 #    bash vm-bootstrap.sh --list          show steps
 #
-#  Run as root (typical for a homelab VM) or as a sudo-capable user.
-#  Re-running is safe: every step is idempotent.
+#  Environment overrides: AGENT_USER (default agent), NODE_MAJOR (default 26)
+#  Re-running is safe: every step is idempotent. After the first run the
+#  script lives at /home/agent/vm-bootstrap.sh and can be re-run as agent.
 # =============================================================================
 set -euo pipefail
 
+AGENT_USER="${AGENT_USER:-agent}"
+AGENT_HOME="/home/${AGENT_USER}"
+AGENT_SCRIPT="${AGENT_HOME}/vm-bootstrap.sh"
 NODE_MAJOR="${NODE_MAJOR:-26}"
-GLAB_FALLBACK_VERSION="1.120.0"     # used if the GitLab API can't be reached
-SYSTEM_GITCONFIG="/etc/gitconfig"   # helpers go here → every Linux user benefits
+GLAB_FALLBACK_VERSION="1.120.0"       # used if the GitLab API can't be reached
 
-ALL_STEPS=(base node docker claude grok codex t3 git remind)
+CRED_FILE="/etc/git-credentials"
+CRED_GROUP="gitcreds"
+GH_BIN="/usr/bin/gh"
+GLAB_BIN="/usr/bin/glab"
+
+ALL_STEPS=(agent base node docker claude grok codex t3 git remind)
 
 # ----------------------------------------------------------------------------- ui
 if [[ -t 1 ]]; then
@@ -42,18 +57,10 @@ else
 fi
 
 STEP_NO=0; STEP_TOTAL=0
-step()  {
+step() {
   STEP_NO=$((STEP_NO+1))
   printf '\n%s%s┌─[%d/%d] %s%s\n' "$C_BOLD" "$C_BLUE" "$STEP_NO" "$STEP_TOTAL" "$*" "$C_RESET"
   printf '%s%s└%s%s\n' "$C_BOLD" "$C_BLUE" "$(printf '─%.0s' $(seq 1 60))" "$C_RESET"
-}
-banner() {
-  printf '%s%s\n' "$C_BOLD$C_BLUE" '  ██╗   ██╗███╗   ███╗      ██████╗  ██████╗  ██████╗ ████████╗'
-  printf '%s\n'   '  ██║   ██║████╗ ████║      ██╔══██╗██╔═══██╗██╔═══██╗╚══██╔══╝'
-  printf '%s\n'   '  ██║   ██║██╔████╔██║█████╗██████╔╝██║   ██║██║   ██║   ██║   '
-  printf '%s\n'   '  ╚██╗ ██╔╝██║╚██╔╝██║╚════╝██╔══██╗██║   ██║██║   ██║   ██║   '
-  printf '%s\n'   '   ╚████╔╝ ██║ ╚═╝ ██║      ██████╔╝╚██████╔╝╚██████╔╝   ██║   '
-  printf '%s%s\n' '    ╚═══╝  ╚═╝     ╚═╝      ╚═════╝  ╚═════╝  ╚═════╝    ╚═╝   ' "$C_RESET"
 }
 info()  { printf '%s    %s%s\n' "$C_DIM" "$*" "$C_RESET"; }
 ok()    { printf '%s  ✔ %s%s\n' "$C_GREEN" "$*" "$C_RESET"; }
@@ -61,7 +68,7 @@ warn()  { printf '%s  ! %s%s\n' "$C_YELLOW" "$*" "$C_RESET"; }
 fail()  { printf '%s  ✘ %s%s\n' "$C_RED" "$*" "$C_RESET" >&2; }
 die()   { fail "$@"; exit 1; }
 
-ask() {               # ask "Prompt" default  → echoes answer
+ask() {               # ask "Prompt" [default] → echoes answer
   local prompt="$1" default="${2:-}" answer
   if [[ -n "$default" ]]; then
     read -r -p "  $prompt [$default]: " answer </dev/tty
@@ -77,13 +84,6 @@ ask_secret() {        # like ask, but no echo
   printf '\n' >/dev/tty
   printf '%s' "$answer"
 }
-confirm() {           # confirm "Question?" [y|n]  → exit 0 on yes
-  local prompt="$1" default="${2:-y}" answer hint
-  [[ "$default" == "y" ]] && hint="Y/n" || hint="y/N"
-  read -r -p "  $prompt [$hint] " answer </dev/tty
-  answer="${answer:-$default}"
-  [[ "$answer" =~ ^[Yy] ]]
-}
 choose() {            # choose "Prompt" opt1 opt2 ... → echoes chosen index (1-based)
   local prompt="$1"; shift
   local i=1 answer
@@ -96,17 +96,57 @@ choose() {            # choose "Prompt" opt1 opt2 ... → echoes chosen index (1
   done
 }
 
-apt_install() { $SUDO apt-get install -y -q "$@"; }
-apt_update()  { $SUDO apt-get update -q; }
+apt_install() { sudo apt-get install -y -q "$@"; }
+apt_update()  { sudo apt-get update -q; }
 
-ensure_path_line() {  # ensure_path_line '<dir>'  → adds to ~/.bashrc and ~/.profile once
-  local dir="$1" line
+ensure_path_line() {  # ensure_path_line <dir> → adds to ~/.bashrc and ~/.profile once
+  local dir="$1" line rc
   line="export PATH=\"$dir:\$PATH\""
-  for rc in "$TARGET_HOME/.bashrc" "$TARGET_HOME/.profile"; do
+  for rc in "$HOME/.bashrc" "$HOME/.profile"; do
     touch "$rc"
     grep -qF "$line" "$rc" || printf '\n%s\n' "$line" >>"$rc"
   done
   case ":$PATH:" in *":$dir:"*) ;; *) export PATH="$dir:$PATH" ;; esac
+}
+
+# ============================================================================= agent user
+#  Runs as root, before anything else. Properties of the account:
+#    * no login password         → `su - agent` never prompts; SSH password
+#                                  login stays impossible (PermitEmptyPasswords no)
+#    * NOPASSWD sudo             → full system access without prompts
+#    * bash, /home/agent         → claude / grok / codex / t3 live there
+#  Claude Code only blocks --dangerously-skip-permissions for uid 0 (unless
+#  IS_SANDBOX=1), so sudo rights on a non-root user are not a problem.
+create_agent_user() {
+  if ! id "$AGENT_USER" >/dev/null 2>&1; then
+    useradd --create-home --shell /bin/bash --user-group "$AGENT_USER"
+    ok "created user $AGENT_USER ($AGENT_HOME)"
+  fi
+  usermod --shell /bin/bash "$AGENT_USER"
+  passwd -d "$AGENT_USER" >/dev/null
+  command -v sudo >/dev/null || { apt-get update -q; apt-get install -y -q sudo; }
+  printf '%s ALL=(ALL:ALL) NOPASSWD:ALL\n' "$AGENT_USER" >"/etc/sudoers.d/${AGENT_USER}"
+  chmod 0440 "/etc/sudoers.d/${AGENT_USER}"
+  visudo -cf "/etc/sudoers.d/${AGENT_USER}" >/dev/null || die "invalid sudoers entry for $AGENT_USER"
+}
+
+# Copy this script into agent's home and continue there. Never returns.
+reexec_as_agent() {
+  [[ -f "$0" ]] || die "Run from a saved file (bash vm-bootstrap.sh), not a pipe: the script re-executes itself as $AGENT_USER."
+  install -m 0755 -o "$AGENT_USER" -g "$AGENT_USER" "$0" "$AGENT_SCRIPT"
+  info "continuing as $AGENT_USER: bash $AGENT_SCRIPT $*"
+  exec runuser -u "$AGENT_USER" -- env \
+       HOME="$AGENT_HOME" USER="$AGENT_USER" LOGNAME="$AGENT_USER" \
+       AGENT_USER="$AGENT_USER" NODE_MAJOR="$NODE_MAJOR" \
+       bash "$AGENT_SCRIPT" "$@"
+}
+
+step_agent() {
+  step "User ${AGENT_USER}"
+  [[ $EUID -ne 0 ]] || die "still running as root"
+  sudo -n true 2>/dev/null || die "$AGENT_USER cannot sudo without a password (check /etc/sudoers.d/${AGENT_USER})"
+  ok "running as $(id -un) (uid $(id -u)), home $HOME"
+  ok "passwordless sudo works; no login password set"
 }
 
 # ============================================================================= steps
@@ -123,10 +163,10 @@ step_node() {
   if command -v node >/dev/null && [[ "$(node -v | sed 's/^v//' | cut -d. -f1)" == "$NODE_MAJOR" ]]; then
     info "node $(node -v) already installed"
   else
-    curl -fsSL "https://deb.nodesource.com/setup_${NODE_MAJOR}.x" | ${SUDO:+$SUDO -E} bash -
+    curl -fsSL "https://deb.nodesource.com/setup_${NODE_MAJOR}.x" | sudo -E bash -
     apt_install nodejs
   fi
-  $SUDO npm install -g npm@latest >/dev/null
+  sudo npm install -g npm@latest >/dev/null
   ok "node $(node -v), npm $(npm -v)"
 }
 
@@ -135,11 +175,10 @@ step_docker() {
   if command -v docker >/dev/null; then
     info "docker already installed: $(docker --version)"
   else
-    apt_install ca-certificates curl
-    $SUDO install -m 0755 -d /etc/apt/keyrings
-    $SUDO curl -fsSL "https://download.docker.com/linux/${DISTRO_ID}/gpg" -o /etc/apt/keyrings/docker.asc
-    $SUDO chmod a+r /etc/apt/keyrings/docker.asc
-    $SUDO tee /etc/apt/sources.list.d/docker.sources >/dev/null <<EOF
+    sudo install -m 0755 -d /etc/apt/keyrings
+    sudo curl -fsSL "https://download.docker.com/linux/${DISTRO_ID}/gpg" -o /etc/apt/keyrings/docker.asc
+    sudo chmod a+r /etc/apt/keyrings/docker.asc
+    sudo tee /etc/apt/sources.list.d/docker.sources >/dev/null <<EOF
 Types: deb
 URIs: https://download.docker.com/linux/${DISTRO_ID}
 Suites: ${DISTRO_CODENAME}
@@ -150,10 +189,10 @@ EOF
     apt_update
     apt_install docker-ce docker-ce-cli containerd.io docker-buildx-plugin docker-compose-plugin
   fi
-  $SUDO systemctl enable --now docker >/dev/null 2>&1 || warn "could not enable docker.service (no systemd?)"
-  if [[ $EUID -ne 0 ]] && ! id -nG | grep -qw docker; then
-    $SUDO usermod -aG docker "$USER"
-    warn "Added $USER to the docker group — log out/in for it to take effect."
+  sudo systemctl enable --now docker >/dev/null 2>&1 || warn "could not enable docker.service (no systemd?)"
+  if ! id -nG | grep -qw docker; then
+    sudo usermod -aG docker "$USER"
+    info "added $USER to the docker group (effective on next login)"
   fi
   ok "$(docker --version) / $(docker compose version 2>/dev/null || echo 'compose n/a')"
 }
@@ -161,52 +200,46 @@ EOF
 step_claude() {
   step "Claude Code"
   curl -fsSL https://claude.ai/install.sh | bash
-  ensure_path_line "$TARGET_HOME/.local/bin"
+  ensure_path_line "$HOME/.local/bin"
   ok "claude $(claude --version 2>/dev/null || echo installed)"
 }
 
 step_grok() {
   step "Grok CLI (xAI)"
   curl -fsSL https://x.ai/cli/install.sh | bash
-  ensure_path_line "$TARGET_HOME/.local/bin"
+  ensure_path_line "$HOME/.local/bin"
   ok "grok $(grok --version 2>/dev/null || echo installed)"
 }
 
 step_codex() {
   step "Codex CLI (OpenAI)"
   curl -fsSL https://chatgpt.com/codex/install.sh | sh
-  ensure_path_line "$TARGET_HOME/.local/bin"
+  ensure_path_line "$HOME/.local/bin"
   ok "codex $(codex --version 2>/dev/null || echo installed)"
 }
 
 step_t3() {
   step "t3"
-  $SUDO npm install -g t3@latest >/dev/null
+  sudo npm install -g t3@latest >/dev/null
   ok "t3 $(t3 --version 2>/dev/null || echo installed)"
 }
 
 # ----------------------------------------------------------------------------- git
 #  Design goal: `git` must authenticate for ANY Linux user, with NO TTY, NO HOME
-#  and a minimal PATH — i.e. exactly how an agent (t3 code, CI, cron) runs it.
-#  Therefore:
+#  and a minimal PATH — exactly how an agent (t3 code, CI, cron) runs it.
 #    * all wiring lives in /etc/gitconfig           (not ~/.gitconfig)
 #    * tokens live in /etc/git-credentials          (root:gitcreds 0640) and are
 #      tried FIRST; gh/glab are only a fallback with absolute binary paths
 #    * GIT_TERMINAL_PROMPT=0 globally → fail fast instead of hanging an agent
 #    * every account is verified with `env -i ... git ls-remote` at the end
-CRED_FILE="/etc/git-credentials"
-CRED_GROUP="gitcreds"
-GH_BIN="/usr/bin/gh"
-GLAB_BIN="/usr/bin/glab"
-
 install_gh() {
   command -v gh >/dev/null && { info "gh $(gh --version | head -1 | awk '{print $3}') present"; return; }
-  $SUDO install -m 0755 -d /etc/apt/keyrings
-  $SUDO curl -fsSL https://cli.github.com/packages/githubcli-archive-keyring.gpg \
+  sudo install -m 0755 -d /etc/apt/keyrings
+  sudo curl -fsSL https://cli.github.com/packages/githubcli-archive-keyring.gpg \
        -o /etc/apt/keyrings/githubcli-archive-keyring.gpg
-  $SUDO chmod go+r /etc/apt/keyrings/githubcli-archive-keyring.gpg
+  sudo chmod go+r /etc/apt/keyrings/githubcli-archive-keyring.gpg
   echo "deb [arch=${ARCH} signed-by=/etc/apt/keyrings/githubcli-archive-keyring.gpg] https://cli.github.com/packages stable main" \
-    | $SUDO tee /etc/apt/sources.list.d/github-cli.list >/dev/null
+    | sudo tee /etc/apt/sources.list.d/github-cli.list >/dev/null
   apt_update
   apt_install gh
   ok "gh $(gh --version | head -1 | awk '{print $3}')"
@@ -223,7 +256,7 @@ install_glab() {
   tmp="$(mktemp -d)"
   curl -fsSL "https://gitlab.com/gitlab-org/cli/-/releases/v${ver}/downloads/${deb}" -o "$tmp/$deb" \
     || die "Could not download glab ${ver} for ${ARCH}."
-  $SUDO dpkg -i "$tmp/$deb" >/dev/null
+  sudo dpkg -i "$tmp/$deb" >/dev/null
   rm -rf "$tmp"
   ok "glab ${ver}"
 }
@@ -231,32 +264,33 @@ install_glab() {
 # One-time system wiring (idempotent)
 git_system_setup() {
   # shared credential store, readable by root + members of $CRED_GROUP
-  $SUDO groupadd -f "$CRED_GROUP"
-  $SUDO touch "$CRED_FILE"
-  $SUDO chown "root:$CRED_GROUP" "$CRED_FILE"
-  $SUDO chmod 0640 "$CRED_FILE"
-  # every human user on the box (uid >= 1000) + whoever invoked us may read it
+  sudo groupadd -f "$CRED_GROUP"
+  sudo touch "$CRED_FILE"
+  sudo chown "root:$CRED_GROUP" "$CRED_FILE"
+  sudo chmod 0640 "$CRED_FILE"
+  # every regular user on the box (uid >= 1000) may read it
   local u
-  for u in $(awk -F: '$3>=1000 && $3<65534 {print $1}' /etc/passwd) ${SUDO_USER:-}; do
-    id -nG "$u" 2>/dev/null | grep -qw "$CRED_GROUP" || $SUDO usermod -aG "$CRED_GROUP" "$u"
-  done
+  while IFS= read -r u; do
+    id -nG "$u" 2>/dev/null | grep -qw "$CRED_GROUP" || sudo usermod -aG "$CRED_GROUP" "$u"
+  done < <(awk -F: '$3>=1000 && $3<65534 {print $1}' /etc/passwd)
 
   # /etc/gitconfig — the generic store helper is tried first for every host
-  $SUDO git config --system --unset-all credential.helper 2>/dev/null || true
-  $SUDO git config --system credential.helper "store --file=${CRED_FILE}"
-  $SUDO git config --system core.askPass ""
-  $SUDO git config --system safe.directory '*'          # repos owned by another user are fine
-  $SUDO git config --system init.defaultBranch main
+  sudo git config --system --unset-all credential.helper 2>/dev/null || true
+  sudo git config --system credential.helper "store --file=${CRED_FILE}"
+  sudo git config --system core.askPass ""
+  sudo git config --system safe.directory '*'          # repos owned by another user are fine
+  sudo git config --system init.defaultBranch main
 
   # never let an agent hang on a username/password prompt
-  printf 'export GIT_TERMINAL_PROMPT=0\nexport GIT_ASKPASS=\n' | $SUDO tee /etc/profile.d/git-noprompt.sh >/dev/null
+  printf 'export GIT_TERMINAL_PROMPT=0\nexport GIT_ASKPASS=\n' | sudo tee /etc/profile.d/git-noprompt.sh >/dev/null
   grep -q '^GIT_TERMINAL_PROMPT=' /etc/environment 2>/dev/null \
-    || echo 'GIT_TERMINAL_PROMPT=0' | $SUDO tee -a /etc/environment >/dev/null
+    || echo 'GIT_TERMINAL_PROMPT=0' | sudo tee -a /etc/environment >/dev/null
 
   # HTTPS everywhere: kill any https→ssh rewrites in system/global config
+  local scope k
   for scope in --system --global; do
     for k in $(git config $scope --name-only --get-regexp '^url\..*\.insteadof$' 2>/dev/null || true); do
-      $SUDO git config $scope --unset-all "$k" 2>/dev/null || true
+      sudo git config $scope --unset-all "$k" 2>/dev/null || true
     done
   done
 }
@@ -264,18 +298,18 @@ git_system_setup() {
 # per-host fallback helper (store is already first via the generic entry)
 wire_git_host() {     # wire_git_host <host> <helper-cmd>
   local url="https://$1" helper="$2"
-  $SUDO git config --system --unset-all "credential.${url}.helper" 2>/dev/null || true
-  $SUDO git config --system "credential.${url}.helper" "$helper"
+  sudo git config --system --unset-all "credential.${url}.helper" 2>/dev/null || true
+  sudo git config --system "credential.${url}.helper" "$helper"
 }
 
 store_git_credential() {  # store_git_credential <host> <username> <token>
   local host="$1" user="$2" tok="$3"
   # drop an older entry for the same host+user, then add
   printf 'protocol=https\nhost=%s\nusername=%s\n' "$host" "$user" \
-    | $SUDO git credential-store --file "$CRED_FILE" erase 2>/dev/null || true
+    | sudo git credential-store --file "$CRED_FILE" erase 2>/dev/null || true
   printf 'protocol=https\nhost=%s\nusername=%s\npassword=%s\n' "$host" "$user" "$tok" \
-    | $SUDO git credential-store --file "$CRED_FILE" store
-  $SUDO chown "root:$CRED_GROUP" "$CRED_FILE"; $SUDO chmod 0640 "$CRED_FILE"
+    | sudo git credential-store --file "$CRED_FILE" store
+  sudo chown "root:$CRED_GROUP" "$CRED_FILE"; sudo chmod 0640 "$CRED_FILE"
 }
 
 # The real test: no HOME, no TTY, minimal PATH — how an agent runs git.
@@ -370,7 +404,7 @@ account_status() {
   fi
   printf '  %s── GitLab ───────────────────────────────────────────%s\n' "$C_DIM" "$C_RESET"
   local hosts
-  hosts="$($SUDO sed -nE 's#^https://[^@]*@([^/]+).*#\1#p' "$CRED_FILE" 2>/dev/null | grep -v '^github\.com$' | sort -u || true)"
+  hosts="$(sudo sed -nE 's#^https://[^@]*@([^/]+).*#\1#p' "$CRED_FILE" 2>/dev/null | grep -v '^github\.com$' | sort -u || true)"
   if [[ -z "$hosts" ]]; then
     printf '    %s(none)%s\n' "$C_DIM" "$C_RESET"
   else
@@ -382,8 +416,8 @@ account_status() {
     done
   fi
   printf '  %s── stored credentials (%s) ──%s\n' "$C_DIM" "$CRED_FILE" "$C_RESET"
-  if $SUDO test -s "$CRED_FILE"; then
-    $SUDO sed -E 's#^https://([^:]+):[^@]*@(.+)$#    \2  (\1)#' "$CRED_FILE"
+  if sudo test -s "$CRED_FILE"; then
+    sudo sed -E 's#^https://([^:]+):[^@]*@(.+)$#    \2  (\1)#' "$CRED_FILE"
   else
     printf '    %s(empty)%s\n' "$C_DIM" "$C_RESET"
   fi
@@ -400,7 +434,7 @@ test_repo_url() {
 verify_all() {
   echo
   printf '  %sFinal check — every stored credential, agent-mode%s\n' "$C_BOLD" "$C_RESET"
-  $SUDO test -s "$CRED_FILE" || { warn "no credentials stored"; return; }
+  sudo test -s "$CRED_FILE" || { warn "no credentials stored"; return; }
   local line host user
   while IFS= read -r line; do
     host="$(sed -E 's#^https://[^@]*@([^/]+).*#\1#' <<<"$line")"
@@ -412,7 +446,7 @@ verify_all() {
         verify_host "$host ($user)" "$(GITLAB_HOST="$host" glab api 'projects?membership=true&per_page=1' 2>/dev/null \
                                       | jq -r '.[0].http_url_to_repo // empty' || true)" ;;
     esac
-  done < <($SUDO cat "$CRED_FILE")
+  done < <(sudo cat "$CRED_FILE")
 }
 
 account_hub() {
@@ -444,32 +478,32 @@ step_git() {
   install_glab
   git_system_setup
 
-  # identity (global for the user running this; system-wide fallback too)
+  # identity: for agent (global) and as system-wide fallback for every other user
   local cur_name cur_mail name mail
   cur_name="$(git config --global user.name  || true)"
   cur_mail="$(git config --global user.email || true)"
   echo
   name="$(ask "git user.name"  "${cur_name:-}")"
   mail="$(ask "git user.email" "${cur_mail:-}")"
-  git config --global user.name  "$name";  $SUDO git config --system user.name  "$name"
-  git config --global user.email "$mail";  $SUDO git config --system user.email "$mail"
+  git config --global user.name  "$name";  sudo git config --system user.name  "$name"
+  git config --global user.email "$mail";  sudo git config --system user.email "$mail"
   git config --global pull.rebase false
 
   account_hub
   verify_all
 
-  # hand straight over to t3 code (interactive account link) if it is installed
+  # interactive t3 code account link, as agent, once git is proven to work
   if command -v t3 >/dev/null; then
     echo
     printf '  %sConnecting t3 code (t3 connect)%s\n' "$C_BOLD" "$C_RESET"
-    t3 connect </dev/tty || warn "t3 connect did not finish — run it again later: t3 connect"
+    t3 connect </dev/tty || warn "t3 connect did not finish — run it again later as $USER: t3 connect"
   else
     warn "t3 not installed (step 't3' skipped?) — run 't3 connect' after installing it"
   fi
 
   echo
-  ok "git wiring: $SYSTEM_GITCONFIG + $CRED_FILE (group $CRED_GROUP)"
-  info "new Linux users later: usermod -aG $CRED_GROUP <user>"
+  ok "git wiring: /etc/gitconfig + $CRED_FILE (group $CRED_GROUP)"
+  info "new Linux users later: sudo usermod -aG $CRED_GROUP <user>"
   info "two accounts on the same host? put the user in the remote: https://<user>@github.com/org/repo.git"
 }
 
@@ -477,23 +511,24 @@ step_remind() {
   step "Final steps"
   cat <<EOF
 
-  ${C_BOLD}${C_YELLOW}1. Reload your shell (or open a new SSH session):${C_RESET}
-       ${C_BOLD}source ~/.bashrc${C_RESET}
+  ${C_BOLD}${C_YELLOW}1. Work as ${AGENT_USER} (no password):${C_RESET}
+       ${C_BOLD}su - ${AGENT_USER}${C_RESET}
 
-  ${C_BOLD}${C_YELLOW}2. Log in to your subscriptions:${C_RESET}
+  ${C_BOLD}${C_YELLOW}2. Log in to your subscriptions (as ${AGENT_USER}):${C_RESET}
        ${C_BOLD}claude${C_RESET}        → /login        (Claude Pro/Max)
        ${C_BOLD}codex login${C_RESET}                   (ChatGPT Plus/Pro)
        ${C_BOLD}grok${C_RESET}          → follow prompt (SuperGrok)
 
-  ${C_DIM}git is ready for agents: HTTPS, no TTY/HOME needed, any user.
-  add accounts later:  bash $0 --only git     reconnect t3:  t3 connect${C_RESET}
+  ${C_DIM}claude --dangerously-skip-permissions works for ${AGENT_USER} (only uid 0 is blocked).
+  git is ready for agents: HTTPS, no TTY/HOME needed, any user.
+  add accounts later:  bash $AGENT_SCRIPT --only git     reconnect t3:  t3 connect${C_RESET}
 EOF
 }
 
 # ============================================================================= main
 usage() { sed -n '2,/^# ====*$/p' "$0" | sed '$d' | sed 's/^# \{0,1\}//'; }
 
-# --- args (before any OS checks so --help/--list work anywhere)
+ORIG_ARGS=("$@")
 ONLY=""; SKIP=""
 while [[ $# -gt 0 ]]; do
   case "$1" in
@@ -504,13 +539,6 @@ while [[ $# -gt 0 ]]; do
     *) die "Unknown option: $1 (see --help)" ;;
   esac
 done
-
-# --- environment
-if [[ $EUID -eq 0 ]]; then SUDO=""; else
-  command -v sudo >/dev/null || die "Not root and sudo is missing."
-  SUDO="sudo"
-fi
-export DEBIAN_FRONTEND=noninteractive
 
 [[ -r /etc/os-release ]] || die "Unsupported OS: /etc/os-release missing."
 # shellcheck disable=SC1091
@@ -523,11 +551,13 @@ case "$DISTRO_ID" in
   *) warn "Untested distro '$DISTRO_ID' — proceeding as if Debian." ;;
 esac
 
-TARGET_HOME="$HOME"
-if [[ -n "${SUDO_USER:-}" && "$SUDO_USER" != "root" ]]; then
-  warn "Started via sudo: user-level tools (claude, grok, codex, t3) install for root,"
-  warn "not for $SUDO_USER. Run as the user you actually work as if that's not intended."
+# --- phase 1 (root): create agent, hand over. Phase 2 below runs as agent.
+if [[ "$(id -un)" != "$AGENT_USER" ]]; then
+  [[ $EUID -eq 0 ]] || die "Run as root (the script switches to $AGENT_USER by itself)."
+  create_agent_user
+  reexec_as_agent "${ORIG_ARGS[@]}"
 fi
+export DEBIAN_FRONTEND=noninteractive
 
 in_list() { [[ ",$2," == *",$1,"* ]]; }
 RUN=()
@@ -538,8 +568,7 @@ done
 [[ ${#RUN[@]} -gt 0 ]] || die "nothing to run"
 
 STEP_TOTAL=${#RUN[@]}
-banner
-printf '  %s%s%s · %s %s · %s · as %s\n' "$C_BOLD" "$(hostname)" "$C_RESET" "$DISTRO_ID" "$DISTRO_CODENAME" "$ARCH" "$(id -un)"
+printf '\n  %s%s%s · %s %s · %s · as %s\n' "$C_BOLD" "$(hostname)" "$C_RESET" "$DISTRO_ID" "$DISTRO_CODENAME" "$ARCH" "$(id -un)"
 info "steps: ${RUN[*]}"
 
 START=$(date +%s)
