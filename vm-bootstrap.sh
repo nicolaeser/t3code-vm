@@ -79,6 +79,7 @@ create_agent_user() {
 reexec_as_agent() {
   [[ -f "$0" ]] || die "Run from a saved file (bash vm-bootstrap.sh), not a pipe."
   install -m 0755 -o "$AGENT_USER" -g "$AGENT_USER" "$0" "$AGENT_SCRIPT"
+  cd "$AGENT_HOME"
   exec runuser -u "$AGENT_USER" -- env \
        HOME="$AGENT_HOME" USER="$AGENT_USER" LOGNAME="$AGENT_USER" \
        AGENT_USER="$AGENT_USER" NODE_MAJOR="$NODE_MAJOR" \
