@@ -6,6 +6,7 @@ AGENT_HOME="/home/${AGENT_USER}"
 AGENT_SCRIPT="${AGENT_HOME}/vm-bootstrap.sh"
 NODE_MAJOR="${NODE_MAJOR:-26}"
 GLAB_FALLBACK_VERSION="1.120.0"
+CLAUDE_INSTALL_TIMEOUT=600
 CRED_FILE="/etc/git-credentials"
 CRED_GROUP="gitcreds"
 
@@ -95,7 +96,7 @@ step_agent() {
 step_base() {
   step "Base packages"
   apt_update
-  apt_install ca-certificates curl git jq unzip build-essential
+  apt_install ca-certificates curl git jq unzip zstd build-essential
   ok "curl $(curl --version | head -1 | awk '{print $2}'), git $(git --version | awk '{print $3}')"
 }
 
@@ -135,11 +136,37 @@ EOF
   ok "$(docker --version)"
 }
 
+claude_cpu_ok() {
+  [[ "$(uname -m)" == x86_64 ]] || return 0
+  local flags f missing=()
+  flags=" $(grep -m1 '^flags' /proc/cpuinfo | cut -d: -f2) "
+  for f in sse4_2 popcnt; do [[ "$flags" == *" $f "* ]] || missing+=("$f"); done
+  [[ ${#missing[@]} -eq 0 ]] && return 0
+  fail "CPU lacks ${missing[*]}: $(grep -m1 '^model name' /proc/cpuinfo | cut -d: -f2- | sed 's/^ *//')"
+  info "Claude Code hangs forever on generic KVM CPU models (kvm64/qemu64)."
+  info "Set the VM CPU type to 'host' (or x86-64-v2 or newer), power-cycle the VM, then:"
+  info "bash $AGENT_SCRIPT --only claude"
+  return 1
+}
+
 step_claude() {
   step "Claude Code"
-  curl -fsSL https://claude.ai/install.sh | bash
+  claude_cpu_ok || { warn "skipping Claude Code"; return 0; }
+  local tmp rc=0
+  tmp="$(mktemp)"
+  curl -fsSL --retry 3 --connect-timeout 20 https://claude.ai/install.sh -o "$tmp" \
+    && timeout --foreground "$CLAUDE_INSTALL_TIMEOUT" bash "$tmp" </dev/null || rc=$?
+  rm -f "$tmp"
   ensure_path_line "$HOME/.local/bin"
-  ok "claude $(claude --version 2>/dev/null || echo installed)"
+  if (( rc != 0 )); then
+    pkill -KILL -u "$USER" -f 'downloads\.claude\.ai|/\.claude/downloads/claude-' 2>/dev/null || true
+    stty sane </dev/tty 2>/dev/null || true
+    if (( rc == 124 )); then fail "Claude installer stopped after ${CLAUDE_INSTALL_TIMEOUT}s without finishing"
+    else fail "Claude installer failed (exit $rc)"; fi
+    warn "continuing without Claude Code — retry: bash $AGENT_SCRIPT --only claude"
+    return 0
+  fi
+  ok "claude $(timeout -k 5 20 claude --version 2>/dev/null || echo installed)"
 }
 
 step_grok() {
@@ -369,6 +396,7 @@ step_remind() {
 
   ${C_DIM}add accounts later:  bash $AGENT_SCRIPT --only git${C_RESET}
 EOF
+  command -v claude >/dev/null || warn "Claude Code is NOT installed — see step Claude Code above"
 }
 
 usage() {
